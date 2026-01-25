@@ -1,11 +1,11 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import sqlite3 from 'sqlite3';
+import pkg from 'pg';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import fs from 'fs';
+import { dirname } from 'path';
 
+const { Pool } = pkg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -17,42 +17,46 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
-// 确保 data 目录存在
-const dataDir = join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-// 初始化 SQLite 数据库
-const db = new sqlite3.Database(join(dataDir, 'quiz.db'), (err) => {
-  if (err) {
-    console.error('数据库连接失败:', err);
-  } else {
-    console.log('✓ SQLite 数据库已连接');
-    initializeDatabase();
-  }
+// PostgreSQL 连接池配置
+const pool = new Pool({
+  user: process.env.POSTGRES_USER || 'root',
+  password: process.env.POSTGRES_PASSWORD || 'P5tS806WpO1q97XT3CAagYUJ2xQ4fDnH',
+  host: process.env.POSTGRES_HOST || 'postgresql',
+  port: process.env.POSTGRES_PORT || 5432,
+  database: process.env.POSTGRES_DB || 'zeabur',
 });
 
 // 初始化数据库表
-function initializeDatabase() {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS quiz_banks (
-      id TEXT PRIMARY KEY,
-      fileName TEXT NOT NULL,
-      timestamp INTEGER NOT NULL,
-      difficulty TEXT NOT NULL,
-      questions TEXT NOT NULL,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `, (err) => {
-    if (err) {
-      console.error('创建表失败:', err);
-    } else {
-      console.log('✓ 数据库表已初始化');
-    }
-  });
+async function initializeDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS quiz_banks (
+        id TEXT PRIMARY KEY,
+        fileName TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        difficulty TEXT NOT NULL,
+        questions JSONB NOT NULL,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✓ PostgreSQL 数据库表已初始化');
+  } catch (err) {
+    console.error('创建表失败:', err);
+  }
 }
+
+// 连接池事件处理
+pool.on('error', (err) => {
+  console.error('数据库连接池错误:', err);
+});
+
+pool.on('connect', () => {
+  console.log('✓ PostgreSQL 数据库已连接');
+});
+
+// 初始化数据库
+initializeDatabase();
 
 // 健康检查
 app.get('/health', (req, res) => {
@@ -60,85 +64,84 @@ app.get('/health', (req, res) => {
 });
 
 // 获取所有题库
-app.get('/getBank', (req, res) => {
-  db.all('SELECT * FROM quiz_banks ORDER BY timestamp DESC', (err, rows) => {
-    if (err) {
-      console.error('查询失败:', err);
-      return res.status(500).json({ success: false, error: err.message });
-    }
+app.get('/getBank', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM quiz_banks ORDER BY timestamp DESC'
+    );
     
-    // 将 JSON 字符串转换回对象
-    const data = rows.map(row => ({
+    const data = result.rows.map(row => ({
       ...row,
-      questions: JSON.parse(row.questions)
+      questions: typeof row.questions === 'string' 
+        ? JSON.parse(row.questions) 
+        : row.questions
     }));
     
     res.json({ success: true, data });
-  });
+  } catch (err) {
+    console.error('查询失败:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // 保存题库
-app.post('/saveBank', (req, res) => {
+app.post('/saveBank', async (req, res) => {
   const { data } = req.body;
   
   if (!Array.isArray(data)) {
     return res.status(400).json({ success: false, error: '数据格式错误' });
   }
 
-  // 清空现有数据并插入新数据
-  db.serialize(() => {
-    db.run('DELETE FROM quiz_banks', (err) => {
-      if (err) {
-        console.error('清空表失败:', err);
-        return res.status(500).json({ success: false, error: err.message });
-      }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // 清空现有数据
+    await client.query('DELETE FROM quiz_banks');
 
-      let completed = 0;
-      let hasError = false;
+    // 插入新数据
+    for (const record of data) {
+      const { id, fileName, timestamp, difficulty, questions } = record;
+      
+      await client.query(
+        `INSERT INTO quiz_banks (id, fileName, timestamp, difficulty, questions)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [id, fileName, timestamp, difficulty, JSON.stringify(questions)]
+      );
+    }
 
-      data.forEach((record) => {
-        const { id, fileName, timestamp, difficulty, questions } = record;
-        
-        db.run(
-          `INSERT INTO quiz_banks (id, fileName, timestamp, difficulty, questions)
-           VALUES (?, ?, ?, ?, ?)`,
-          [id, fileName, timestamp, difficulty, JSON.stringify(questions)],
-          (err) => {
-            completed++;
-            if (err) {
-              console.error('插入失败:', err);
-              hasError = true;
-            }
-
-            // 所有记录处理完成
-            if (completed === data.length) {
-              if (hasError) {
-                res.status(500).json({ success: false, error: '部分数据保存失败' });
-              } else {
-                console.log(`✓ 已保存 ${data.length} 条题库记录`);
-                res.json({ success: true, message: `已保存 ${data.length} 条记录` });
-              }
-            }
-          }
-        );
-      });
-    });
-  });
+    await client.query('COMMIT');
+    console.log(`✓ 已保存 ${data.length} 条题库记录`);
+    res.json({ success: true, message: `已保存 ${data.length} 条记录` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('保存失败:', err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 // 删除单条题库
-app.delete('/deleteBank/:id', (req, res) => {
+app.delete('/deleteBank/:id', async (req, res) => {
   const { id } = req.params;
   
-  db.run('DELETE FROM quiz_banks WHERE id = ?', [id], (err) => {
-    if (err) {
-      console.error('删除失败:', err);
-      return res.status(500).json({ success: false, error: err.message });
+  try {
+    const result = await pool.query(
+      'DELETE FROM quiz_banks WHERE id = $1',
+      [id]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: '题库不存在' });
     }
     
     console.log(`✓ 已删除题库: ${id}`);
     res.json({ success: true, message: '题库已删除' });
-  });
+  } catch (err) {
+    console.error('删除失败:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // 启动服务器
@@ -153,14 +156,9 @@ app.listen(PORT, () => {
 });
 
 // 优雅关闭
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\n正在关闭数据库连接...');
-  db.close((err) => {
-    if (err) {
-      console.error('关闭数据库失败:', err);
-    } else {
-      console.log('✓ 数据库已关闭');
-    }
-    process.exit(0);
-  });
+  await pool.end();
+  console.log('✓ 数据库已关闭');
+  process.exit(0);
 });
