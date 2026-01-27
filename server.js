@@ -127,6 +127,10 @@ app.delete('/api/banks/:id', async (req, res) => {
 app.get('/health', (req, res) => {  
   res.json({ status: 'ok' });  
 });  
+// 根路由  
+app.get('/', (req, res) => {  
+  res.json({ message: '欢迎使用题库 API 服务' });  
+});  
 const PORT = process.env.PORT || 8080;  
 // 启动服务器  
 async function start() {  
